@@ -114,6 +114,7 @@ h1{font-size:22px;line-height:1.25;margin:0;font-weight:700;letter-spacing:-.01e
 .banner.sample{background:var(--warn-soft);color:var(--warn)}
 .banner.warn{background:var(--warn-soft);color:var(--warn)}
 .banner.err{background:var(--err-soft);color:var(--err)}
+.banner-act{padding:3px 10px;font-size:12px;margin-left:4px;background:var(--surface);vertical-align:1px}
 
 .panes{display:grid;grid-template-columns:1fr 1fr;height:min(74vh,860px);min-height:420px;position:relative}
 .panes[data-view="md"],.panes[data-view="preview"]{grid-template-columns:1fr}
@@ -183,13 +184,14 @@ textarea:focus{outline:none}
           <label class="opt"><input type="checkbox" id="opt-headers" checked><b>머리글·바닥글 빼기</b><small>PDF 전용 · 매 쪽 반복되는 문구와 쪽 번호를 지워요</small></label>
           <label class="opt"><input type="checkbox" id="opt-columns" checked><b>2단 편집 인식</b><small>PDF 전용 · 두 단으로 나뉜 쪽을 왼쪽 단부터 읽어요</small></label>
           <label class="opt"><input type="checkbox" id="opt-notes" checked><b>발표자 노트 포함</b><small>PPTX 전용 · 슬라이드 노트를 인용문으로 넣어요</small></label>
+          <label class="opt"><input type="checkbox" id="opt-ocr"><b>스캔본 OCR</b><small>PDF 전용 · 글자가 없는 쪽을 그림에서 읽어요. 처음 한 번 언어 데이터를 내려받고, 쪽당 몇 초 걸려요</small></label>
         </fieldset>
       </section>
 
       <section>
         <h2 class="label"><span>파일</span><button type="button" id="clear" hidden>모두 지우기</button></h2>
         <div class="files" id="files"></div>
-        <p class="note">텍스트만 옮기며, 이미지·도형·수식은 제외돼요. 스캔한 PDF는 글자 정보가 없어 OCR을 먼저 거쳐야 해요. 파워포인트는 .pptx만 되고, 옛 .ppt는 먼저 .pptx로 저장해 주세요.</p>
+        <p class="note">텍스트만 옮기며, 이미지·도형·수식은 제외돼요. 스캔한 PDF는 글자 정보가 없어요. 스캔본 OCR 옵션을 켜면 그림에서 글자를 읽어요. 파워포인트는 .pptx만 되고, 옛 .ppt는 먼저 .pptx로 저장해 주세요.</p>
       </section>
     </aside>
 
@@ -285,7 +287,8 @@ const store = {
 
 const opts = () => ({
   headers: $('#opt-headers').checked, bold: $('#opt-bold').checked, tables: $('#opt-tables').checked,
-  columns: $('#opt-columns').checked, pageBreaks: $('#opt-pages').checked, notes: $('#opt-notes').checked
+  columns: $('#opt-columns').checked, pageBreaks: $('#opt-pages').checked, notes: $('#opt-notes').checked,
+  ocr: $('#opt-ocr').checked
 });
 
 const BOLD_RE = /bold|black|heavy|semibold|demibold|extrabold|ultrabold/i;
@@ -308,20 +311,130 @@ async function convertPdf(buf, o, onProgress) {
   const pdf = await task.promise;
   const total = pdf.numPages;
   const pages = [];
+  let ocrDone = 0;
   try {
     for (let n = 1; n <= total; n++) {
       const page = await pdf.getPage(n);
       pages.push(await readPage(page, n, o));
       page.cleanup();
-      onProgress(n, total);
+      onProgress(n, total, 'read');
       await new Promise(r => setTimeout(r, 0));
+    }
+    // 글자가 없는 쪽(스캔본)은 그림으로 그린 뒤 OCR로 읽어요
+    if (o.ocr) {
+      const blank = pages.filter(p => p.chars < 20);
+      if (blank.length) {
+        onProgress(0, blank.length, 'ocr-load');
+        const worker = await getOcrWorker();
+        for (const p of blank) {
+          const page = await pdf.getPage(p.n);
+          const res = await ocrPage(worker, page, o);
+          page.cleanup();
+          Object.assign(p, res);
+          onProgress(++ocrDone, blank.length, 'ocr');
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
     }
   } finally { pdf.destroy(); }
   const chars = pages.reduce((s, p) => s + p.chars, 0);
   const md = toMarkdown(pages, o);
-  const warning = chars < total * 20
-    ? '글자를 거의 찾지 못했어요. 스캔한 이미지로 된 PDF라면 OCR로 글자를 먼저 인식시켜야 해요.' : null;
-  return { md, pages: total, warning };
+  let warning = null;
+  if (chars < total * 20) warning = '글자를 거의 찾지 못했어요. 스캔한 이미지로 된 PDF라면 OCR로 읽어야 해요.';
+  else if (ocrDone) warning = `글자가 없는 ${ocrDone}쪽은 OCR로 읽었어요. 잘못 읽은 글자가 있을 수 있으니 확인해 주세요.`;
+  return { md, pages: total, warning, needsOcr: !o.ocr && pages.some(p => p.chars < 20) };
+}
+
+/* ---------------- OCR (스캔본) ---------------- */
+
+let tessLoad = null, ocrWorker = null, ocrLog = null;
+
+function loadScript(src, err) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res; s.onerror = () => rej(new Error(err));
+    document.head.appendChild(s);
+  });
+}
+
+async function getOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+  if (!tessLoad) tessLoad = loadScript('https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js',
+    'OCR 엔진을 불러오지 못했어요. 인터넷 연결을 확인해 주세요.');
+  await tessLoad;
+  ocrWorker = await Tesseract.createWorker(['kor', 'eng'], 1, {
+    workerPath: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/worker.min.js',
+    corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+    logger: m => ocrLog && ocrLog(m)
+  });
+  return ocrWorker;
+}
+
+async function ocrPage(worker, page, o) {
+  const base = page.getViewport({ scale: 1 });
+  // 한글 OCR은 글자가 클수록 잘 읽혀요: 가로 3000px을 목표로 하되 너무 큰 그림은 줄여요
+  let scale = Math.min(6, Math.max(2, 3000 / base.width));
+  const MAX_PX = 16e6;
+  if (base.width * base.height * scale * scale > MAX_PX) scale = Math.sqrt(MAX_PX / (base.width * base.height));
+  const vp = page.getViewport({ scale });
+  const w = Math.round(vp.width), h = Math.round(vp.height);
+  // OffscreenCanvas에 그리면 다른 탭을 보고 있어도 렌더링이 멈추지 않아요
+  const canvas = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(w, h) : document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  await page.render({ canvasContext: ctx, viewport: vp, intent: 'print' }).promise;
+  const image = canvas.convertToBlob ? await canvas.convertToBlob({ type: 'image/png' }) : canvas;
+
+  const { data } = await worker.recognize(image, {}, { blocks: true, text: false });
+  canvas.width = canvas.height = 0;   // 메모리 정리
+
+  // 줄·단 구분은 Tesseract가 알려 주는 읽기 순서를 그대로 따라요
+  const lines = [];
+  let chars = 0;
+  for (const block of data.blocks || []) {
+    for (const para of block.paragraphs || []) {
+      for (const line of para.lines || []) {
+        if (typeof line.confidence === 'number' && line.confidence < 55) continue;   // 자신 없게 읽은 줄은 버려요
+        const items = [];
+        for (const w of line.words || []) {
+          const t = (w.text || '').trim();
+          if (!t || w.confidence < 45) continue;
+          const b = w.bbox;
+          const size = Math.max(4, Math.round((b.y1 - b.y0) / scale / 2) * 2);   // 크기를 성기게 묶어 제목 판정이 흔들리지 않게
+          chars += t.length;
+          items.push({ str: t, x: b.x0 / scale, y: b.y1 / scale, w: (b.x1 - b.x0) / scale, size, space: false, bold: false });
+        }
+        if (!items.length) continue;
+        const built = buildLine({ y: (line.bbox?.y1 ?? items[0].y * scale) / scale, items });
+        if (!built.text) continue;
+        built.page = page.pageNumber; built.col = 0; built.conf = line.confidence;
+        lines.push(built);
+      }
+    }
+  }
+  return { lines: cleanOcrLines(lines), chars, height: base.height, ocr: true };
+}
+
+// OCR 결과 다듬기: 혼자 떨어진 글머리표는 다음 줄에 붙이고, 뜻 없는 기호 줄은 버려요
+function cleanOcrLines(lines) {
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i], next = lines[i + 1];
+    if (/^[•*◦·∙▪■□O0oe°]$/.test(l.text) && next && next.col === l.col
+        && Math.abs(next.y - l.y) <= Math.max(l.size, next.size) * 1.6 && next.x0 > l.x0) {
+      next.segs[0]?.runs.unshift({ t: '• ', b: false });
+      next.text = '• ' + next.text;
+      next.x0 = l.x0;
+      continue;
+    }
+    if (l.text.length <= 2 && !/[\p{L}\p{N}]/u.test(l.text)) continue;
+    // 자음·모음만 떨어져 나온 글자가 많으면 잘못 읽은 줄로 보고 버려요
+    const solid = (l.text.match(/[가-힣a-zA-Z0-9]/g) || []).length / l.text.length;
+    if (solid < 0.6 && (l.conf ?? 100) < 80) continue;
+    out.push(l);
+  }
+  return out;
 }
 
 async function readPage(page, n, o) {
@@ -354,9 +467,13 @@ async function readPage(page, n, o) {
     items.push({ str, x, y, w: it.width || 0, size, space, bold: !space && o.bold && isBold(it.fontName) });
   }
 
+  return { n, lines: linesFromItems(items, o, vp.width, n), chars, height: vp.height };
+}
+
+function linesFromItems(items, o, width, n) {
   let groups = [items];
   if (o.columns) {
-    const cut = findGutter(items, vp.width);
+    const cut = findGutter(items, width);
     if (cut != null) {
       const L = [], R = [];
       for (const it of items) (it.x < cut ? L : R).push(it);
@@ -365,7 +482,7 @@ async function readPage(page, n, o) {
   }
   const lines = [];
   groups.forEach((g, col) => groupLines(g).forEach(l => { l.col = col; l.page = n; lines.push(l); }));
-  return { n, lines, chars, height: vp.height };
+  return lines;
 }
 
 function findGutter(items, W) {
@@ -384,13 +501,13 @@ function findGutter(items, W) {
     if (free && start < 0) start = k;
     if (!free && start >= 0) { const len = k - start; if (!best || len > best.len) best = { len, start }; start = -1; }
   }
-  if (!best || best.len * B < 8) return null;
+  if (!best || best.len * B < Math.max(10, W * 0.035)) return null;   // 단 사이 여백은 넉넉히 넓어야 해요
   const cut = (best.start + best.len / 2) * B;
   const L = real.filter(i => i.x + i.w <= cut), R = real.filter(i => i.x >= cut);
   if (L.length < real.length * 0.2 || R.length < real.length * 0.2) return null;
   const span = a => { let mn = Infinity, mx = -Infinity; for (const i of a) { mn = Math.min(mn, i.y); mx = Math.max(mx, i.y); } return mx - mn; };
   const all = span(real);
-  if (span(L) < all * 0.35 || span(R) < all * 0.35) return null;
+  if (span(L) < all * 0.5 || span(R) < all * 0.5) return null;
   return cut;
 }
 
@@ -399,7 +516,7 @@ function groupLines(items) {
   const raw = [];
   for (const it of sorted) {
     const L = raw[raw.length - 1];
-    if (L && Math.abs(it.y - L.y) <= Math.max(1.5, Math.min(it.size, L.size) * 0.4)) L.items.push(it);
+    if (L && Math.abs(it.y - L.y) <= Math.max(1.5, Math.min(it.size, L.size) * 0.4, Math.max(it.size, L.size) * 0.28)) L.items.push(it);
     else raw.push({ y: it.y, size: it.size, items: [it] });
   }
   return raw.map(buildLine).filter(l => l.text);
@@ -550,7 +667,7 @@ function toMarkdown(pages, o) {
 
   pages.forEach((p, pi) => {
     if (pi > 0 && o.pageBreaks) { flush(); blocks.push({ type: 'hr' }); }
-    const tables = o.tables ? detectTables(p.lines, r => runsToMd(r, !o.bold)) : [];
+    const tables = o.tables ? detectTables(p.lines, r => runsToMd(r, !o.bold), !!p.ocr) : [];
     let ti = 0;
     for (let i = 0; i < p.lines.length; i++) {
       if (ti < tables.length && i === tables[ti].start) {
@@ -610,7 +727,7 @@ function toMarkdown(pages, o) {
   return out.join('').replace(/\n{3,}/g, '\n\n').trim() + '\n';
 }
 
-function detectTables(lines, cellMd) {
+function detectTables(lines, cellMd, strict) {
   const res = [];
   let i = 0;
   while (i < lines.length) {
@@ -623,7 +740,9 @@ function detectTables(lines, cellMd) {
     }
     const rows = lines.slice(i, j + 1);
     const maxSeg = Math.max(...rows.map(r => r.segs.length));
-    if (rows.length >= 3 || (rows.length >= 2 && maxSeg >= 3)) {
+    // OCR로 읽은 쪽은 잘못 읽은 줄이 표로 둔갑하기 쉬워 조건을 더 깐깐하게 봐요
+    const enough = strict ? rows.length >= 3 && maxSeg <= 6 : rows.length >= 3 || (rows.length >= 2 && maxSeg >= 3);
+    if (enough) {
       const md = buildTable(rows, cellMd);
       if (md) res.push({ start: i, end: j, md });
     }
@@ -901,7 +1020,19 @@ function showActive() {
   else if (f.status === 'error') { banner = f.error; cls = 'err'; }
   else if (f.warning) { banner = f.warning; cls = 'warn'; }
   E.banner.hidden = !banner;
-  if (banner) { E.banner.textContent = banner; E.banner.className = 'banner ' + cls; }
+  if (banner) {
+    E.banner.textContent = banner;
+    E.banner.className = 'banner ' + cls;
+    if (f.needsOcr && f.status === 'done') {
+      const btn = document.createElement('button');
+      btn.type = 'button'; btn.className = 'btn banner-act'; btn.textContent = 'OCR로 다시 읽기';
+      btn.addEventListener('click', () => {
+        f.ocr = true; f.status = 'queued'; f.progress = 0; f.warning = null; f.needsOcr = false;
+        renderList(); showActive(); processQueue();
+      });
+      E.banner.append(' ', btn);
+    }
+  }
   const md = f.status === 'done' ? f.md : '';
   if (E.src.value !== md) E.src.value = md;
   E.src.readOnly = f.status !== 'done';
@@ -910,9 +1041,11 @@ function showActive() {
   E.copy.disabled = E.save.disabled = !md;
 }
 
-function setBusy(f) {
+function setBusy(f, note) {
   const unit = f.kind === 'pptx' ? '장' : '쪽';
   E.busyText.textContent = f.status === 'queued' ? '차례를 기다리는 중…'
+    : f.stage === 'ocr-load' ? (/traineddata/.test(note || '') ? 'OCR 언어 데이터 내려받는 중…' : 'OCR 엔진 준비 중…')
+    : f.stage === 'ocr' ? `스캔된 ${f.total}${unit} 중 ${f.done}${unit} OCR로 읽는 중…`
     : f.total ? `${f.total}${unit} 중 ${f.done}${unit} 읽는 중…` : '파일 여는 중…';
   E.busyBar.style.width = (f.progress || 0) * 100 + '%';
 }
@@ -933,12 +1066,18 @@ async function processQueue() {
     try {
       if (!job.buf) job.buf = await job.file.arrayBuffer();
       const convert = job.kind === 'pptx' ? convertPptx : convertPdf;
-      const res = await convert(job.buf, opts(), (d, t) => {
-        job.done = d; job.total = t; job.progress = d / t;
+      ocrLog = m => {
+        if (job.stage !== 'ocr-load' || !m || typeof m.progress !== 'number') return;
+        job.progress = m.progress;
+        if (job.id === activeId) setBusy(job, m.status);
+      };
+      const res = await convert(job.buf, { ...opts(), ocr: opts().ocr || job.ocr }, (d, t, stage) => {
+        job.done = d; job.total = t; job.stage = stage; job.progress = t ? d / t : 0;
         const bar = E.files.querySelector(`[data-id="${job.id}"] .bar i`); if (bar) bar.style.width = job.progress * 100 + '%';
         if (job.id === activeId) setBusy(job);
       });
-      Object.assign(job, { status: 'done', md: res.md, pages: res.pages, unit: res.unit || '쪽', warning: res.warning, error: null });
+      ocrLog = null;
+      Object.assign(job, { status: 'done', md: res.md, pages: res.pages, unit: res.unit || '쪽', warning: res.warning, needsOcr: res.needsOcr, error: null });
     } catch (e) {
       console.error(e);
       Object.assign(job, { status: 'error', error: explain(e), md: '' });
