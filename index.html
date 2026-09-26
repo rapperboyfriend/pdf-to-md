@@ -91,6 +91,12 @@ h1{font-size:22px;line-height:1.25;margin:0;font-weight:700;letter-spacing:-.01e
 .chip.working,.chip.queued{background:var(--accent-soft);color:var(--accent)}
 .chip.error{background:var(--err-soft);color:var(--err)}
 .chip.sample{background:var(--warn-soft);color:var(--warn)}
+.subopts{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:-2px 0 6px 36px;font-size:12.5px;color:var(--muted)}
+.subopts[aria-disabled="true"]{opacity:.45;pointer-events:none}
+.subopts select{border:1px solid var(--line-strong);background:var(--surface);border-radius:6px;padding:3px 6px;font-size:12.5px}
+.sub-check{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+.sub-check input{width:14px;height:14px;accent-color:var(--accent);margin:0}
+.sub-check span{font-size:11.5px;opacity:.85}
 .note{font-size:12px;color:var(--muted);line-height:1.6;margin:0;padding:12px 2px 0;border-top:1px solid var(--line)}
 
 /* output */
@@ -185,6 +191,15 @@ textarea:focus{outline:none}
           <label class="opt"><input type="checkbox" id="opt-columns" checked><b>2단 편집 인식</b><small>PDF 전용 · 두 단으로 나뉜 쪽을 왼쪽 단부터 읽어요</small></label>
           <label class="opt"><input type="checkbox" id="opt-notes" checked><b>발표자 노트 포함</b><small>PPTX 전용 · 슬라이드 노트를 인용문으로 넣어요</small></label>
           <label class="opt"><input type="checkbox" id="opt-ocr"><b>스캔본 OCR</b><small>PDF 전용 · 글자가 없는 쪽을 그림에서 읽어요. 처음 한 번 언어 데이터를 내려받고, 쪽당 몇 초 걸려요</small></label>
+          <div class="subopts" id="ocr-subs">
+            <label for="opt-ocr-lang">읽을 언어</label>
+            <select id="opt-ocr-lang">
+              <option value="kor+eng">한국어 + 영어</option>
+              <option value="kor">한국어만</option>
+              <option value="eng">영어만</option>
+            </select>
+            <label class="sub-check"><input type="checkbox" id="opt-ocr-best"> 정확도 우선 <span>(2~3배 느리고 데이터 약 25MB)</span></label>
+          </div>
         </fieldset>
       </section>
 
@@ -288,7 +303,7 @@ const store = {
 const opts = () => ({
   headers: $('#opt-headers').checked, bold: $('#opt-bold').checked, tables: $('#opt-tables').checked,
   columns: $('#opt-columns').checked, pageBreaks: $('#opt-pages').checked, notes: $('#opt-notes').checked,
-  ocr: $('#opt-ocr').checked
+  ocr: $('#opt-ocr').checked, ocrLang: $('#opt-ocr-lang').value, ocrBest: $('#opt-ocr-best').checked
 });
 
 const BOLD_RE = /bold|black|heavy|semibold|demibold|extrabold|ultrabold/i;
@@ -325,7 +340,7 @@ async function convertPdf(buf, o, onProgress) {
       const blank = pages.filter(p => p.chars < 20);
       if (blank.length) {
         onProgress(0, blank.length, 'ocr-load');
-        const worker = await getOcrWorker();
+        const worker = await getOcrWorker(o);
         for (const p of blank) {
           const page = await pdf.getPage(p.n);
           const res = await ocrPage(worker, page, o);
@@ -347,7 +362,7 @@ async function convertPdf(buf, o, onProgress) {
 
 /* ---------------- OCR (스캔본) ---------------- */
 
-let tessLoad = null, ocrWorker = null, ocrLog = null;
+let tessLoad = null, ocrWorker = null, ocrWorkerKey = '', ocrLog = null;
 
 function loadScript(src, err) {
   return new Promise((res, rej) => {
@@ -357,23 +372,34 @@ function loadScript(src, err) {
   });
 }
 
-async function getOcrWorker() {
-  if (ocrWorker) return ocrWorker;
+async function getOcrWorker(o) {
+  const langs = (o.ocrLang || 'kor+eng').split('+');
+  // 정확도 우선일 때는 더 정교한 모델과 기울기 감지(osd)를 함께 써요
+  if (o.ocrBest) langs.push('osd');
+  const key = langs.join('+') + (o.ocrBest ? '|best' : '|fast');
+  if (ocrWorker && ocrWorkerKey === key) return ocrWorker;
+  if (ocrWorker) { try { await ocrWorker.terminate(); } catch {} ocrWorker = null; }
   if (!tessLoad) tessLoad = loadScript('https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js',
     'OCR 엔진을 불러오지 못했어요. 인터넷 연결을 확인해 주세요.');
   await tessLoad;
-  ocrWorker = await Tesseract.createWorker(['kor', 'eng'], 1, {
+  ocrWorker = await Tesseract.createWorker(langs, 1, {
     workerPath: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/worker.min.js',
     corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+    langPath: `https://tessdata.projectnaptha.com/4.0.0${o.ocrBest ? '_best' : ''}`,
     logger: m => ocrLog && ocrLog(m)
   });
+  await ocrWorker.setParameters({
+    preserve_interword_spaces: '1',                      // 낱말 사이 띄어쓰기를 살려요
+    tessedit_pageseg_mode: o.ocrBest ? '1' : '3'         // 1은 쪽이 돌아갔는지도 함께 살펴요
+  });
+  ocrWorkerKey = key;
   return ocrWorker;
 }
 
 async function ocrPage(worker, page, o) {
   const base = page.getViewport({ scale: 1 });
-  // 한글 OCR은 글자가 클수록 잘 읽혀요: 가로 3000px을 목표로 하되 너무 큰 그림은 줄여요
-  let scale = Math.min(6, Math.max(2, 3000 / base.width));
+  // 한글 OCR은 글자가 클수록 잘 읽혀요: 가로 3000px(정확도 우선은 3600px)을 목표로 하되 너무 큰 그림은 줄여요
+  let scale = Math.min(6, Math.max(2, (o.ocrBest ? 3600 : 3000) / base.width));
   const MAX_PX = 16e6;
   if (base.width * base.height * scale * scale > MAX_PX) scale = Math.sqrt(MAX_PX / (base.width * base.height));
   const vp = page.getViewport({ scale });
@@ -386,6 +412,7 @@ async function ocrPage(worker, page, o) {
   await page.render({ canvasContext: ctx, viewport: vp, intent: 'print' }).promise;
   const image = canvas.convertToBlob ? await canvas.convertToBlob({ type: 'image/png' }) : canvas;
 
+  await worker.setParameters({ user_defined_dpi: String(Math.round(72 * scale)) });   // 실제 해상도를 알려 주면 더 정확해요
   const { data } = await worker.recognize(image, {}, { blocks: true, text: false });
   canvas.width = canvas.height = 0;   // 메모리 정리
 
@@ -406,7 +433,8 @@ async function ocrPage(worker, page, o) {
           items.push({ str: t, x: b.x0 / scale, y: b.y1 / scale, w: (b.x1 - b.x0) / scale, size, space: false, bold: false });
         }
         if (!items.length) continue;
-        const built = buildLine({ y: (line.bbox?.y1 ?? items[0].y * scale) / scale, items });
+        // OCR은 한 낱말을 토막 내기도 해서, 확실히 벌어진 곳에만 띄어쓰기를 넣어요
+        const built = buildLine({ y: (line.bbox?.y1 ?? items[0].y * scale) / scale, items }, 'auto');
         if (!built.text) continue;
         built.page = page.pageNumber; built.col = 0; built.conf = line.confidence;
         lines.push(built);
@@ -430,8 +458,10 @@ function cleanOcrLines(lines) {
     }
     if (l.text.length <= 2 && !/[\p{L}\p{N}]/u.test(l.text)) continue;
     // 자음·모음만 떨어져 나온 글자가 많으면 잘못 읽은 줄로 보고 버려요
-    const solid = (l.text.match(/[가-힣a-zA-Z0-9]/g) || []).length / l.text.length;
-    if (solid < 0.6 && (l.conf ?? 100) < 80) continue;
+    const bare = l.text.replace(/\s/g, '');
+    const solid = (bare.match(/[가-힣a-zA-Z0-9]/g) || []).length / (bare.length || 1);
+    const jamo = (bare.match(/[\u3131-\u3163]/g) || []).length;
+    if ((solid < 0.6 || jamo >= 3) && (l.conf ?? 100) < 80) continue;
     out.push(l);
   }
   return out;
@@ -529,11 +559,28 @@ function pushRun(seg, t, b) {
   if (last && last.b === b) last.t += t; else seg.runs.push({ t, b });
 }
 
-function buildLine(L) {
+function buildLine(L, spaceGap = 0.22) {
   const its = L.items.sort((a, b) => a.x - b.x);
   let wsum = 0, ssum = 0;
   for (const it of its) if (!it.space) { wsum += it.str.length; ssum += it.size * it.str.length; }
   const size = wsum ? ssum / wsum : (its[0]?.size || 10);
+  let thr = size * (typeof spaceGap === 'number' ? spaceGap : 0.3);
+  // OCR 줄은 띄어쓰기 간격이 제각각이라, 이 줄의 간격 분포에서 경계를 직접 찾아요
+  if (spaceGap === 'auto') {
+    const gaps = []; let e = null;
+    for (const it of its) {
+      if (it.space) continue;
+      if (e != null) gaps.push(it.x - e);
+      e = Math.max(e ?? -Infinity, it.x + it.w);
+    }
+    const g = gaps.filter(v => v > 0 && v < size * 1.2).sort((a, b) => a - b);
+    let jump = 0, at = -1;
+    for (let i = 1; i < g.length; i++) {
+      const d = g[i] - g[i - 1];
+      if (d > jump && g[i] > size * 0.12) { jump = d; at = i; }
+    }
+    thr = (g.length >= 3 && at > 0 && jump > size * 0.08) ? (g[at] + g[at - 1]) / 2 : size * 0.3;
+  }
   const segs = [];
   let seg = null, end = null, pend = false, prev = null;
   for (const it of its) {
@@ -542,7 +589,7 @@ function buildLine(L) {
     if (prev && it.str === prev.str && Math.abs(it.x - prev.x) < size * 0.3) { continue; }
     const gap = end == null ? 0 : it.x - end;
     if (!seg || gap > size * 1.3) { seg = { x0: it.x, x1: it.x, runs: [] }; segs.push(seg); }
-    else if (pend || gap > size * 0.22) pushRun(seg, ' ', it.bold);
+    else if (pend || gap > thr) pushRun(seg, ' ', it.bold);
     pushRun(seg, it.str, it.bold);
     seg.x1 = Math.max(seg.x1, it.x + it.w);
     end = Math.max(end ?? -Infinity, it.x + it.w);
@@ -1170,6 +1217,10 @@ E.save.addEventListener('click', async () => {
 
 let tt;
 function toast(msg) { E.toast.textContent = msg; E.toast.classList.add('show'); clearTimeout(tt); tt = setTimeout(() => E.toast.classList.remove('show'), 2200); }
+
+const syncOcrSubs = () => $('#ocr-subs').setAttribute('aria-disabled', String(!$('#opt-ocr').checked));
+$('#opt-ocr').addEventListener('change', syncOcrSubs);
+syncOcrSubs();
 
 const v = store.get('pdf2md-view');
 if (v === 'md' || v === 'preview' || v === 'split') setView(v);
