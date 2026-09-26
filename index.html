@@ -159,7 +159,7 @@ textarea:focus{outline:none}
       <div class="mark" aria-hidden="true">P<b>→</b>#</div>
       <div>
         <h1>PDF 마크다운 변환기</h1>
-        <p class="sub">PDF를 올리면 제목·목록·표 구조를 살려 Markdown(.md)으로 바꿔 드려요.</p>
+        <p class="sub">PDF와 PowerPoint(.pptx)를 올리면 제목·목록·표 구조를 살려 Markdown(.md)으로 바꿔 드려요.</p>
       </div>
     </div>
     <span class="privacy"><i></i>파일은 서버로 올라가지 않고 이 브라우저 안에서만 변환돼요</span>
@@ -169,26 +169,27 @@ textarea:focus{outline:none}
     <aside class="side">
       <label class="drop" id="drop">
         <svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6v18M13 17l7 7 7-7"/><path d="M6 26v5a3 3 0 0 0 3 3h22a3 3 0 0 0 3-3v-5"/></svg>
-        <strong>PDF를 여기에 끌어다 놓으세요</strong>
+        <strong>PDF·PPTX를 여기에 끌어다 놓으세요</strong>
         <span>또는 클릭해서 선택 · 여러 개도 한 번에</span>
-        <input class="sr" id="file-input" type="file" accept="application/pdf,.pdf" multiple>
+        <input class="sr" id="file-input" type="file" accept="application/pdf,.pdf,.pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" multiple>
       </label>
 
       <section>
         <h2 class="label">변환 옵션</h2>
         <fieldset class="opts" id="opts">
-          <label class="opt"><input type="checkbox" id="opt-headers" checked><b>머리글·바닥글 빼기</b><small>매 쪽 반복되는 문구와 쪽 번호를 지워요</small></label>
-          <label class="opt"><input type="checkbox" id="opt-bold" checked><b>굵은 글씨 유지</b><small>굵은 글꼴을 **굵게**로 옮겨요 (조금 느려져요)</small></label>
+          <label class="opt"><input type="checkbox" id="opt-bold" checked><b>굵은 글씨 유지</b><small>굵은 글꼴을 **굵게**로 옮겨요 (PDF는 조금 느려져요)</small></label>
           <label class="opt"><input type="checkbox" id="opt-tables" checked><b>표 인식</b><small>칸이 나뉜 줄을 Markdown 표로 바꿔요</small></label>
-          <label class="opt"><input type="checkbox" id="opt-columns" checked><b>2단 편집 인식</b><small>논문처럼 두 단으로 나뉜 쪽을 왼쪽 단부터 읽어요</small></label>
-          <label class="opt"><input type="checkbox" id="opt-pages"><b>쪽마다 구분선</b><small>쪽이 바뀌는 곳에 --- 를 넣어요</small></label>
+          <label class="opt"><input type="checkbox" id="opt-pages"><b>쪽·슬라이드마다 구분선</b><small>넘어가는 곳에 --- 를 넣어요</small></label>
+          <label class="opt"><input type="checkbox" id="opt-headers" checked><b>머리글·바닥글 빼기</b><small>PDF 전용 · 매 쪽 반복되는 문구와 쪽 번호를 지워요</small></label>
+          <label class="opt"><input type="checkbox" id="opt-columns" checked><b>2단 편집 인식</b><small>PDF 전용 · 두 단으로 나뉜 쪽을 왼쪽 단부터 읽어요</small></label>
+          <label class="opt"><input type="checkbox" id="opt-notes" checked><b>발표자 노트 포함</b><small>PPTX 전용 · 슬라이드 노트를 인용문으로 넣어요</small></label>
         </fieldset>
       </section>
 
       <section>
         <h2 class="label"><span>파일</span><button type="button" id="clear" hidden>모두 지우기</button></h2>
         <div class="files" id="files"></div>
-        <p class="note">텍스트만 옮기며, 이미지·수식은 제외돼요. 스캔한 PDF는 글자 정보가 없어 OCR을 먼저 거쳐야 해요.</p>
+        <p class="note">텍스트만 옮기며, 이미지·도형·수식은 제외돼요. 스캔한 PDF는 글자 정보가 없어 OCR을 먼저 거쳐야 해요. 파워포인트는 .pptx만 되고, 옛 .ppt는 먼저 .pptx로 저장해 주세요.</p>
       </section>
     </aside>
 
@@ -227,6 +228,7 @@ textarea:focus{outline:none}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 <script>
@@ -283,7 +285,7 @@ const store = {
 
 const opts = () => ({
   headers: $('#opt-headers').checked, bold: $('#opt-bold').checked, tables: $('#opt-tables').checked,
-  columns: $('#opt-columns').checked, pageBreaks: $('#opt-pages').checked
+  columns: $('#opt-columns').checked, pageBreaks: $('#opt-pages').checked, notes: $('#opt-notes').checked
 });
 
 const BOLD_RE = /bold|black|heavy|semibold|demibold|extrabold|ultrabold/i;
@@ -657,6 +659,191 @@ function buildTable(rows, cellMd) {
   return [row(grid[0]), '| ' + cols.map(() => '---').join(' | ') + ' |', ...grid.slice(1).map(row)].join('\n');
 }
 
+/* ---------------- PPTX → Markdown ---------------- */
+
+const A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+const P_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+async function convertPptx(buf, o, onProgress) {
+  if (typeof JSZip === 'undefined') throw new Error('변환 엔진(JSZip)을 불러오지 못했어요. 인터넷 연결을 확인하고 새로고침해 주세요.');
+  let zip;
+  try { zip = await JSZip.loadAsync(buf); }
+  catch { throw new Error('PPTX 파일을 열 수 없어요. 파일이 손상되지 않았는지 확인해 주세요.'); }
+  if (zip.file('EncryptedPackage')) throw new Error('암호가 걸린 파일이에요. 암호를 해제한 뒤 다시 올려 주세요.');
+  if (!zip.file('ppt/presentation.xml')) throw new Error('PowerPoint 파일이 아니에요. .pptx 파일인지 확인해 주세요.');
+
+  const xml = async path => {
+    const f = zip.file(path);
+    if (!f) return null;
+    const doc = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
+    return doc.querySelector('parsererror') ? null : doc;
+  };
+  const relMap = async path => {
+    const i = path.lastIndexOf('/');
+    const doc = await xml(path.slice(0, i) + '/_rels' + path.slice(i) + '.rels');
+    const map = {};
+    if (doc) for (const r of doc.getElementsByTagName('Relationship')) {
+      let t = r.getAttribute('Target') || '';
+      if (/^https?:/i.test(t)) { map[r.getAttribute('Id')] = { url: t, type: r.getAttribute('Type') }; continue; }
+      // 상대 경로를 압축 파일 안의 전체 경로로 바꿔요
+      const base = path.slice(0, i).split('/');
+      for (const part of t.replace(/^\//, '').split('/')) {
+        if (part === '..') base.pop(); else if (part !== '.') base.push(part);
+      }
+      map[r.getAttribute('Id')] = { path: base.join('/'), type: r.getAttribute('Type') };
+    }
+    return map;
+  };
+
+  const pres = await xml('ppt/presentation.xml');
+  const presRels = await relMap('ppt/presentation.xml');
+  const slidePaths = [...(pres?.getElementsByTagNameNS(P_NS, 'sldId') || [])]
+    .map(n => presRels[n.getAttributeNS(R_NS, 'id')]?.path).filter(Boolean);
+  if (!slidePaths.length) throw new Error('슬라이드를 찾지 못했어요.');
+
+  const blocks = [];
+  let chars = 0;
+  for (let i = 0; i < slidePaths.length; i++) {
+    const doc = await xml(slidePaths[i]);
+    if (doc) {
+      const res = readSlide(doc, i + 1, o);
+      if (o.notes) {
+        const rels = await relMap(slidePaths[i]);
+        const notePath = Object.values(rels).find(r => /notesSlide$/.test(r.type || ''))?.path;
+        if (notePath) {
+          const nd = await xml(notePath);
+          const note = nd ? readNotes(nd) : '';
+          if (note) res.push({ type: 'note', text: note });
+        }
+      }
+      for (const b of res) chars += b.text ? b.text.length : 0;
+      blocks.push({ slide: i + 1, items: res });
+    }
+    onProgress(i + 1, slidePaths.length);
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  const out = [];
+  blocks.forEach(({ slide, items }, i) => {
+    if (i > 0 && o.pageBreaks) out.push('---');
+    const hasTitle = items.some(b => b.type === 'h');
+    if (!hasTitle) out.push(`## 슬라이드 ${slide}`);
+    let prevLi = false;
+    for (const b of items) {
+      if (b.type === 'h') out.push(`## ${b.text}`);
+      else if (b.type === 'table') out.push(b.md);
+      else if (b.type === 'note') out.push(b.text.split('\n').map(l => '> ' + l).join('\n> \n'));
+      else if (b.type === 'li') {
+        const s = ' '.repeat(b.level * 4) + '- ' + b.text;
+        if (prevLi) out[out.length - 1] += '\n' + s; else out.push(s);
+        prevLi = true; continue;
+      } else out.push(b.text);
+      prevLi = false;
+    }
+  });
+  const md = out.filter(s => s && s.trim()).join('\n\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+  return {
+    md, pages: slidePaths.length, unit: '장',
+    warning: chars < slidePaths.length * 5 ? '글자를 거의 찾지 못했어요. 슬라이드가 이미지로만 되어 있으면 옮길 글자가 없어요.' : null
+  };
+}
+
+function readSlide(doc, n, o) {
+  const tree = doc.getElementsByTagNameNS(P_NS, 'spTree')[0];
+  if (!tree) return [];
+  const shapes = [];
+  const walk = el => {
+    for (const child of el.children) {
+      if (child.namespaceURI !== P_NS) continue;
+      if (child.localName === 'grpSp') { walk(child); continue; }
+      if (child.localName === 'sp' || child.localName === 'graphicFrame') {
+        const off = child.getElementsByTagNameNS(A_NS, 'off')[0];
+        shapes.push({ el: child, y: off ? +off.getAttribute('y') || 0 : 0, x: off ? +off.getAttribute('x') || 0 : 0 });
+      }
+    }
+  };
+  walk(tree);
+
+  const titles = [], rest = [];
+  for (const s of shapes) {
+    const ph = s.el.getElementsByTagNameNS(P_NS, 'ph')[0];
+    const type = ph?.getAttribute('type') || '';
+    if (type === 'sldNum' || type === 'dt' || type === 'ftr') continue;   // 쪽 번호·날짜·바닥글
+    s.title = type === 'title' || type === 'ctrTitle';
+    (s.title ? titles : rest).push(s);
+  }
+  rest.sort((a, b) => a.y - b.y || a.x - b.x);
+
+  const out = [];
+  for (const s of [...titles, ...rest]) {
+    if (s.el.localName === 'graphicFrame') {
+      const tbl = s.el.getElementsByTagNameNS(A_NS, 'tbl')[0];
+      if (!tbl) continue;
+      const md = o.tables ? pptxTable(tbl, o) : null;
+      if (md) out.push({ type: 'table', md, text: md });
+      else for (const p of tbl.getElementsByTagNameNS(A_NS, 'p')) {
+        const t = paraMd(p, o); if (t.text) out.push({ type: 'p', text: t.md });
+      }
+      continue;
+    }
+    const body = s.el.getElementsByTagNameNS(P_NS, 'txBody')[0];
+    if (!body) continue;
+    for (const p of body.getElementsByTagNameNS(A_NS, 'p')) {
+      const t = paraMd(p, o);
+      if (!t.text) continue;
+      if (s.title && !out.some(b => b.type === 'h')) out.push({ type: 'h', text: t.text });
+      else if (t.bullet) out.push({ type: 'li', level: t.level, text: t.md });
+      else out.push({ type: 'p', text: t.md });
+    }
+  }
+  return out;
+}
+
+function paraMd(p, o) {
+  const pPr = [...p.children].find(c => c.localName === 'pPr' && c.namespaceURI === A_NS);
+  const level = Math.min(3, +(pPr?.getAttribute('lvl') || 0));
+  const noBullet = !!pPr?.getElementsByTagNameNS(A_NS, 'buNone').length;
+  const runs = [];
+  for (const node of p.children) {
+    if (node.namespaceURI !== A_NS) continue;
+    if (node.localName === 'br') { const last = runs[runs.length - 1]; if (last) last.t += ' '; continue; }
+    if (node.localName !== 'r') continue;
+    const t = node.getElementsByTagNameNS(A_NS, 't')[0]?.textContent || '';
+    if (!t) continue;
+    const rPr = node.getElementsByTagNameNS(A_NS, 'rPr')[0];
+    const b = o.bold && rPr?.getAttribute('b') === '1';
+    const last = runs[runs.length - 1];
+    if (last && last.b === b) last.t += t; else runs.push({ t, b });
+  }
+  const text = runs.map(r => r.t).join('').replace(/\s+/g, ' ').trim();
+  return { text, md: runsToMd(runs.map(r => ({ t: r.t.replace(/\s+/g, ' '), b: r.b })), false).trim(), level, bullet: !noBullet };
+}
+
+function pptxTable(tbl, o) {
+  const rows = [...tbl.getElementsByTagNameNS(A_NS, 'tr')].map(tr =>
+    [...tr.children].filter(c => c.localName === 'tc' && c.namespaceURI === A_NS).map(tc =>
+      [...tc.getElementsByTagNameNS(A_NS, 'p')].map(p => paraMd(p, o).md).filter(Boolean).join(' ').replace(/\|/g, '\\|')
+    ));
+  if (rows.length < 2 || !rows[0].length) return null;
+  const cols = Math.max(...rows.map(r => r.length));
+  const line = cells => '| ' + Array.from({ length: cols }, (_, i) => cells[i] || ' ').join(' | ') + ' |';
+  return [line(rows[0]), '| ' + Array(cols).fill('---').join(' | ') + ' |', ...rows.slice(1).map(line)].join('\n');
+}
+
+function readNotes(doc) {
+  const out = [];
+  for (const sp of doc.getElementsByTagNameNS(P_NS, 'sp')) {
+    const ph = sp.getElementsByTagNameNS(P_NS, 'ph')[0];
+    if (ph && ph.getAttribute('type') !== 'body') continue;   // 쪽 번호·슬라이드 그림 제외
+    for (const p of sp.getElementsByTagNameNS(A_NS, 'p')) {
+      const t = [...p.getElementsByTagNameNS(A_NS, 't')].map(n => n.textContent).join('').replace(/\s+/g, ' ').trim();
+      if (t) out.push(esc(t));
+    }
+  }
+  return out.join('\n');
+}
+
 /* ---------------- UI ---------------- */
 
 const fmtSize = b => b < 1024 * 1024 ? (b / 1024).toFixed(0) + ' KB' : (b / 1024 / 1024).toFixed(1) + ' MB';
@@ -671,9 +858,10 @@ function renderList() {
     const b = document.createElement('button');
     b.type = 'button'; b.className = 'file'; b.dataset.id = f.id;
     b.setAttribute('aria-current', String(f.id === activeId));
-    const meta = f.sample ? '샘플 결과' : [fmtSize(f.size), f.pages ? f.pages + '쪽' : ''].filter(Boolean).join(' · ');
+    const unit = f.kind === 'pptx' ? '장' : '쪽';
+    const meta = f.sample ? '샘플 결과' : [fmtSize(f.size), f.pages ? f.pages + unit : ''].filter(Boolean).join(' · ');
     const chipCls = f.sample ? 'sample' : f.status;
-    b.innerHTML = `<span class="ficon" aria-hidden="true">PDF</span>
+    b.innerHTML = `<span class="ficon" aria-hidden="true">${f.kind === 'pptx' ? 'PPT' : 'PDF'}</span>
       <span style="min-width:0"><span class="fname"></span><span class="fmeta"></span>${f.status === 'working' || f.status === 'queued' ? '<span class="bar"><i></i></span>' : ''}</span>
       <span class="chip ${chipCls}">${f.sample ? '예시' : STATUS[f.status]}</span>`;
     b.querySelector('.fname').textContent = f.name;
@@ -697,7 +885,7 @@ function updateStats(f) {
   const tables = (md.match(/^\| ?-{3}/gm) || []).length;
   const chars = md.replace(/\s/g, '').length;
   E.stats.textContent = f.status === 'done'
-    ? `${f.pages}쪽 · 제목 ${heads}개 · 표 ${tables}개 · ${chars.toLocaleString('ko-KR')}자` : '';
+    ? `${f.pages}${f.unit || '쪽'} · 제목 ${heads}개 · 표 ${tables}개 · ${chars.toLocaleString('ko-KR')}자` : '';
 }
 
 function showActive() {
@@ -723,7 +911,9 @@ function showActive() {
 }
 
 function setBusy(f) {
-  E.busyText.textContent = f.status === 'queued' ? '차례를 기다리는 중…' : f.total ? `${f.total}쪽 중 ${f.done}쪽 읽는 중…` : 'PDF 여는 중…';
+  const unit = f.kind === 'pptx' ? '장' : '쪽';
+  E.busyText.textContent = f.status === 'queued' ? '차례를 기다리는 중…'
+    : f.total ? `${f.total}${unit} 중 ${f.done}${unit} 읽는 중…` : '파일 여는 중…';
   E.busyBar.style.width = (f.progress || 0) * 100 + '%';
 }
 
@@ -742,12 +932,13 @@ async function processQueue() {
     renderList(); if (job.id === activeId) showActive();
     try {
       if (!job.buf) job.buf = await job.file.arrayBuffer();
-      const res = await convertPdf(job.buf, opts(), (d, t) => {
+      const convert = job.kind === 'pptx' ? convertPptx : convertPdf;
+      const res = await convert(job.buf, opts(), (d, t) => {
         job.done = d; job.total = t; job.progress = d / t;
         const bar = E.files.querySelector(`[data-id="${job.id}"] .bar i`); if (bar) bar.style.width = job.progress * 100 + '%';
         if (job.id === activeId) setBusy(job);
       });
-      Object.assign(job, { status: 'done', md: res.md, pages: res.pages, warning: res.warning, error: null });
+      Object.assign(job, { status: 'done', md: res.md, pages: res.pages, unit: res.unit || '쪽', warning: res.warning, error: null });
     } catch (e) {
       console.error(e);
       Object.assign(job, { status: 'error', error: explain(e), md: '' });
@@ -757,11 +948,18 @@ async function processQueue() {
   busy = false;
 }
 
+const kindOf = f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf' ? 'pdf'
+  : /\.pptx$/i.test(f.name) ? 'pptx' : null;
+
 function addFiles(list) {
-  const pdfs = [...list].filter(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
-  if (pdfs.length < list.length) toast('PDF가 아닌 파일은 건너뛰었어요');
-  if (!pdfs.length) return;
-  const added = pdfs.map(file => ({ id: 'f' + (++seq), name: file.name, size: file.size, file, status: 'queued', progress: 0 }));
+  const ok = [...list].filter(kindOf);
+  if (ok.length < list.length) {
+    toast([...list].some(f => /\.ppt$/i.test(f.name))
+      ? '옛 .ppt는 안 돼요. 파워포인트에서 .pptx로 저장해 주세요'
+      : 'PDF·PPTX가 아닌 파일은 건너뛰었어요');
+  }
+  if (!ok.length) return;
+  const added = ok.map(file => ({ id: 'f' + (++seq), name: file.name, size: file.size, file, kind: kindOf(file), status: 'queued', progress: 0 }));
   files.push(...added);
   activeId = added[0].id;
   renderList(); showActive(); processQueue();
@@ -811,7 +1009,7 @@ dlPromise.then(dl => { if (dl === null) { E.save.hidden = true; } });
 
 E.save.addEventListener('click', async () => {
   const f = current();
-  const filename = f.name.replace(/\.pdf$/i, '') + '.md';
+  const filename = f.name.replace(/\.(pdf|pptx)$/i, '') + '.md';
   const dl = await dlPromise;
   if (dl) {
     try { await dl.save({ filename, data: E.src.value }); toast(filename + ' 저장했어요'); }
