@@ -166,7 +166,7 @@ textarea:focus{outline:none}
       <div class="mark" aria-hidden="true">P<b>→</b>#</div>
       <div>
         <h1>PDF 마크다운 변환기</h1>
-        <p class="sub">PDF와 PowerPoint(.pptx)를 올리면 제목·목록·표 구조를 살려 Markdown(.md)으로 바꿔 드려요.</p>
+        <p class="sub">PDF와 PowerPoint(.pptx)를 올리면 Markdown(.md)으로 바꿔 드려요. PPTX는 PDF로도 저장할 수 있어요.</p>
       </div>
     </div>
     <span class="privacy"><i></i>파일은 서버로 올라가지 않고 이 브라우저 안에서만 변환돼요</span>
@@ -206,7 +206,7 @@ textarea:focus{outline:none}
       <section>
         <h2 class="label"><span>파일</span><button type="button" id="clear" hidden>모두 지우기</button></h2>
         <div class="files" id="files"></div>
-        <p class="note">텍스트만 옮기며, 이미지·도형·수식은 제외돼요. 스캔한 PDF는 글자 정보가 없어요. 스캔본 OCR 옵션을 켜면 그림에서 글자를 읽어요. 파워포인트는 .pptx만 되고, 옛 .ppt는 먼저 .pptx로 저장해 주세요.</p>
+        <p class="note">텍스트만 옮기며, 이미지·도형·수식은 제외돼요. 스캔한 PDF는 글자 정보가 없어요. 스캔본 OCR 옵션을 켜면 그림에서 글자를 읽어요. 파워포인트는 .pptx만 되고, 옛 .ppt는 먼저 .pptx로 저장해 주세요. PPTX를 PDF로 바꿀 때는 차트·애니메이션이 빠지고 글꼴이 달라질 수 있어요.</p>
       </section>
     </aside>
 
@@ -223,6 +223,7 @@ textarea:focus{outline:none}
             <button type="button" data-view="preview" aria-pressed="false">미리보기</button>
           </div>
           <button type="button" class="btn" id="copy"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="5" width="9" height="9" rx="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"/></svg>복사</button>
+          <button type="button" class="btn" id="pdf" hidden><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M4 1.5h5L13 5v9.5H4z"/><path d="M9 1.5V5h4"/></svg>PDF로 저장</button>
           <button type="button" class="btn primary" id="save"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>.md 저장</button>
         </div>
       </div>
@@ -257,8 +258,9 @@ const E = {
   name: $('#doc-name'), chip: $('#doc-chip'), stats: $('#stats'), banner: $('#banner'),
   panes: $('#panes'), src: $('#md-src'), preview: $('#preview'),
   busy: $('#busy'), busyText: $('#busy-text'), busyBar: $('#busy-bar'),
-  copy: $('#copy'), save: $('#save'), toast: $('#toast')
+  copy: $('#copy'), save: $('#save'), pdf: $('#pdf'), toast: $('#toast')
 };
+let pdfBusy = false;
 
 const SAMPLE_MD = `# 2026년 3분기 서비스 운영 보고서
 
@@ -1010,6 +1012,583 @@ function readNotes(doc) {
   return out.join('\n');
 }
 
+/* ---------------- PPTX → PDF ----------------
+   슬라이드를 직접 그려서 PDF로 만들어요. 글자는 선택·복사할 수 있게 글꼴을 넣어요. */
+
+const PT = 12700;                      // 1pt = 12700 EMU
+const FONT_REG = 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/gothica1/GothicA1-Regular.ttf';
+const FONT_BOLD = 'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/gothica1/GothicA1-Bold.ttf';
+let pdfLibLoad = null;
+const fontBytes = {};
+
+async function ensurePdfLibs() {
+  if (!pdfLibLoad) pdfLibLoad = Promise.all([
+    typeof PDFLib === 'undefined' ? loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js', 'PDF 만들기 도구를 불러오지 못했어요. 인터넷 연결을 확인해 주세요.') : null,
+    typeof fontkit === 'undefined' ? loadScript('https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js', 'PDF 글꼴 도구를 불러오지 못했어요. 인터넷 연결을 확인해 주세요.') : null
+  ]);
+  await pdfLibLoad;
+}
+
+async function getFontBytes(which) {
+  if (fontBytes[which]) return fontBytes[which];
+  const res = await fetch(which === 'b' ? FONT_BOLD : FONT_REG);
+  if (!res.ok) throw new Error('한글 글꼴을 내려받지 못했어요. 인터넷 연결을 확인해 주세요.');
+  fontBytes[which] = new Uint8Array(await res.arrayBuffer());
+  return fontBytes[which];
+}
+
+const aChild = (el, name) => { if (el) for (const c of el.children) if (c.namespaceURI === A_NS && c.localName === name) return c; return null; };
+const aFind = (el, name) => el ? el.getElementsByTagNameNS(A_NS, name)[0] || null : null;
+const pFind = (el, name) => el ? el.getElementsByTagNameNS(P_NS, name)[0] || null : null;
+const pct = el => el ? (+el.getAttribute('val') || 0) / 100000 : null;
+
+class Pkg {
+  constructor(zip) { this.zip = zip; this.cache = new Map(); }
+  async xml(path) {
+    if (this.cache.has(path)) return this.cache.get(path);
+    const f = this.zip.file(path);
+    let d = null;
+    if (f) {
+      d = new DOMParser().parseFromString(await f.async('string'), 'application/xml');
+      if (d.querySelector('parsererror')) d = null;
+    }
+    this.cache.set(path, d);
+    return d;
+  }
+  async rels(path) {
+    const key = 'rels:' + path;
+    if (this.cache.has(key)) return this.cache.get(key);
+    const i = path.lastIndexOf('/');
+    const d = await this.xml(path.slice(0, i) + '/_rels' + path.slice(i) + '.rels');
+    const map = {};
+    if (d) for (const r of d.getElementsByTagName('Relationship')) {
+      const t = r.getAttribute('Target') || '';
+      const rec = { type: r.getAttribute('Type') };
+      if (r.getAttribute('TargetMode') === 'External' || /^https?:/i.test(t)) rec.external = t;
+      else {
+        const base = path.slice(0, i).split('/');
+        for (const p of t.replace(/^\//, '').split('/')) { if (p === '..') base.pop(); else if (p !== '.') base.push(p); }
+        rec.path = base.join('/');
+      }
+      map[r.getAttribute('Id')] = rec;
+    }
+    this.cache.set(key, map);
+    return map;
+  }
+  async bytes(path) { const f = this.zip.file(path); return f ? f.async('uint8array') : null; }
+}
+
+function hexRgb(hex) {
+  const n = parseInt((hex || '000000').slice(-6), 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+// 색 하나를 풀어요: 테마 색 이름과 밝기 조절(lumMod·tint·shade)까지 반영해요
+function pickColor(holder, theme) {
+  if (!holder) return null;
+  const node = holder.localName === 'srgbClr' || holder.localName === 'schemeClr' || holder.localName === 'sysClr'
+    ? holder : (aChild(holder, 'srgbClr') || aChild(holder, 'schemeClr') || aChild(holder, 'sysClr'));
+  if (!node) return null;
+  let hex = null;
+  if (node.localName === 'srgbClr') hex = node.getAttribute('val');
+  else if (node.localName === 'sysClr') hex = node.getAttribute('lastClr') || '000000';
+  else {
+    const v = node.getAttribute('val');
+    hex = theme[{ tx1: 'dk1', bg1: 'lt1', tx2: 'dk2', bg2: 'lt2' }[v] || v] || null;
+  }
+  if (!hex) return null;
+  let { r, g, b } = hexRgb(hex);
+  const shade = pct(aChild(node, 'shade')), tint = pct(aChild(node, 'tint'));
+  const lumMod = pct(aChild(node, 'lumMod')), lumOff = pct(aChild(node, 'lumOff'));
+  const map = f => { r = f(r); g = f(g); b = f(b); };
+  if (shade != null) map(v => v * shade);
+  if (tint != null) map(v => v * tint + 255 * (1 - tint));
+  if (lumMod != null) map(v => v * lumMod);
+  if (lumOff != null) map(v => v + 255 * lumOff);
+  const c = v => Math.max(0, Math.min(255, Math.round(v))) / 255;
+  return { r: c(r), g: c(g), b: c(b) };
+}
+
+function fillOf(spPr, theme) {
+  if (!spPr) return null;
+  if (aChild(spPr, 'noFill')) return null;
+  const solid = aChild(spPr, 'solidFill');
+  if (solid) return pickColor(solid, theme);
+  const grad = aChild(spPr, 'gradFill');
+  if (grad) { const gs = aFind(grad, 'gs'); return gs ? pickColor(gs, theme) : null; }   // 그러데이션은 첫 색으로 칠해요
+  const patt = aChild(spPr, 'pattFill');
+  if (patt) return pickColor(aChild(patt, 'fgClr'), theme);
+  return null;
+}
+
+function lineOf(spPr, theme) {
+  const ln = aChild(spPr, 'ln');
+  if (!ln || aChild(ln, 'noFill')) return null;
+  const color = pickColor(aChild(ln, 'solidFill'), theme);
+  if (!color) return null;
+  return { color, width: Math.max(0.5, (+ln.getAttribute('w') || 9525) / PT) };
+}
+
+// 회전은 도형 가운데를 기준으로 도니, pdf-lib이 쓰는 왼쪽 아래 모서리 좌표로 바꿔 줘요
+function rotated(x, y, w, h, deg, H) {
+  const yBottom = H - y - h;
+  if (!deg) return { x, y: yBottom, rotate: 0 };
+  const rad = -deg * Math.PI / 180;
+  const cx = x + w / 2, cy = yBottom + h / 2;
+  const dx = -w / 2, dy = -h / 2;
+  return { x: cx + dx * Math.cos(rad) - dy * Math.sin(rad), y: cy + dx * Math.sin(rad) + dy * Math.cos(rad), rotate: -deg };
+}
+
+function placeOf(xfrm, tf) {
+  const off = aChild(xfrm, 'off'), ext = aChild(xfrm, 'ext');
+  if (!off || !ext) return null;
+  const x = +off.getAttribute('x') || 0, y = +off.getAttribute('y') || 0;
+  const cx = +ext.getAttribute('cx') || 0, cy = +ext.getAttribute('cy') || 0;
+  return {
+    x: (tf.ox + (x - tf.x0) * tf.sx) / PT, y: (tf.oy + (y - tf.y0) * tf.sy) / PT,
+    w: cx * tf.sx / PT, h: cy * tf.sy / PT, rot: (+(xfrm.getAttribute('rot') || 0)) / 60000
+  };
+}
+
+const TF0 = { ox: 0, oy: 0, x0: 0, y0: 0, sx: 1, sy: 1 };
+
+async function pptxToPdf(buf, onProgress) {
+  await ensurePdfLibs();
+  const { PDFDocument, rgb, degrees } = PDFLib;
+  let zip;
+  try { zip = await JSZip.loadAsync(buf); } catch { throw new Error('PPTX 파일을 열 수 없어요.'); }
+  if (zip.file('EncryptedPackage')) throw new Error('암호가 걸린 파일이에요. 암호를 해제한 뒤 다시 올려 주세요.');
+  const pkg = new Pkg(zip);
+  const pres = await pkg.xml('ppt/presentation.xml');
+  if (!pres) throw new Error('PowerPoint 파일이 아니에요. .pptx 파일인지 확인해 주세요.');
+  const sz = pFind(pres, 'sldSz');
+  const W = (+sz?.getAttribute('cx') || 9144000) / PT, H = (+sz?.getAttribute('cy') || 6858000) / PT;
+
+  const presRels = await pkg.rels('ppt/presentation.xml');
+  const slidePaths = [...pres.getElementsByTagNameNS(P_NS, 'sldId')]
+    .map(n => presRels[n.getAttributeNS(R_NS, 'id')]?.path).filter(Boolean);
+  if (!slidePaths.length) throw new Error('슬라이드를 찾지 못했어요.');
+
+  const doc = await PDFDocument.create();
+  doc.registerFontkit(fontkit);
+  // 글꼴은 통째로 넣어야 한글이 깨지지 않아서, 굵은 글꼴은 실제로 쓸 때만 넣어요
+  let usesBold = false;
+  for (const name of Object.keys(zip.files)) {
+    if (!/^ppt\/(slides|slideLayouts|slideMasters)\/[^/]+\.xml$/.test(name)) continue;
+    if (/ b="1"/.test(await zip.file(name).async('string'))) { usesBold = true; break; }
+  }
+  const reg = await doc.embedFont(await getFontBytes('r'), { subset: false });
+  const fonts = { r: reg, b: usesBold ? await doc.embedFont(await getFontBytes('b'), { subset: false }) : reg };
+  const skipped = { chart: 0, image: 0 };
+
+  for (let i = 0; i < slidePaths.length; i++) {
+    const page = doc.addPage([W, H]);
+    const env = { pkg, doc, page, fonts, H, W, rgb, degrees, images: new Map(), skipped };
+    await drawSlide(env, slidePaths[i]);
+    onProgress(i + 1, slidePaths.length);
+    await new Promise(r => setTimeout(r, 0));
+  }
+
+  const bytes = await doc.save({ useObjectStreams: true });
+  const notes = [];
+  if (skipped.chart) notes.push(`차트·다이어그램 ${skipped.chart}개`);
+  if (skipped.image) notes.push(`옮기지 못한 그림 ${skipped.image}개`);
+  return { bytes, pages: slidePaths.length, warning: notes.length ? notes.join(', ') + '는 빠졌어요.' : null };
+}
+
+async function drawSlide(env, slidePath) {
+  const { pkg } = env;
+  const slide = await pkg.xml(slidePath);
+  if (!slide) return;
+  const sRels = await pkg.rels(slidePath);
+  const layoutPath = Object.values(sRels).find(r => /slideLayout$/.test(r.type || ''))?.path;
+  const layout = layoutPath ? await pkg.xml(layoutPath) : null;
+  const lRels = layoutPath ? await pkg.rels(layoutPath) : {};
+  const masterPath = Object.values(lRels).find(r => /slideMaster$/.test(r.type || ''))?.path;
+  const master = masterPath ? await pkg.xml(masterPath) : null;
+  const mRels = masterPath ? await pkg.rels(masterPath) : {};
+
+  const themePath = Object.values(mRels).find(r => /theme$/.test(r.type || ''))?.path;
+  const themeDoc = themePath ? await pkg.xml(themePath) : null;
+  const theme = {};
+  const scheme = themeDoc && aFind(themeDoc.documentElement, 'clrScheme');
+  if (scheme) for (const c of scheme.children) {
+    const srgb = aChild(c, 'srgbClr'), sys = aChild(c, 'sysClr');
+    theme[c.localName] = srgb ? srgb.getAttribute('val') : (sys ? sys.getAttribute('lastClr') || '000000' : null);
+  }
+  env.theme = theme;
+  env.styles = masterTextStyles(master, theme);
+
+  // 배경 → 마스터·레이아웃의 장식 → 슬라이드 내용 차례로 그려요
+  const bg = fillOf(pFind(slide, 'bgPr'), theme) || fillOf(pFind(layout, 'bgPr'), theme) || fillOf(pFind(master, 'bgPr'), theme);
+  if (bg) env.page.drawRectangle({ x: 0, y: 0, width: env.W, height: env.H, color: env.rgb(bg.r, bg.g, bg.b) });
+
+  for (const [part, path] of [[master, masterPath], [layout, layoutPath]]) {
+    if (!part) continue;
+    env.partPath = path;
+    env.rels = await pkg.rels(path);
+    await walkTree(env, pFind(part, 'spTree'), TF0, true);
+  }
+  env.partPath = slidePath;
+  env.rels = sRels;
+  env.phSource = { layout, master };
+  await walkTree(env, pFind(slide, 'spTree'), TF0, false);
+}
+
+// 마스터의 기본 글자 크기·색을 단계별로 읽어 둬요
+function masterTextStyles(master, theme) {
+  const out = { title: [], body: [], other: [] };
+  const styles = master && pFind(master, 'txStyles');
+  const read = (el, into) => {
+    if (!el) return;
+    for (let i = 1; i <= 9; i++) {
+      const lvl = aChild(el, `lvl${i}pPr`);
+      const def = lvl && aChild(lvl, 'defRPr');
+      into.push({
+        size: def && def.getAttribute('sz') ? +def.getAttribute('sz') / 100 : null,
+        bold: def?.getAttribute('b') === '1',
+        color: def ? pickColor(aChild(def, 'solidFill'), theme) : null,
+        align: lvl?.getAttribute('algn') || null,
+        marL: lvl && lvl.getAttribute('marL') ? +lvl.getAttribute('marL') / PT : null,
+        bullet: lvl ? !aChild(lvl, 'buNone') : true
+      });
+    }
+  };
+  if (styles) {
+    read(pFind(styles, 'titleStyle'), out.title);
+    read(pFind(styles, 'bodyStyle'), out.body);
+    read(pFind(styles, 'otherStyle'), out.other);
+  }
+  return out;
+}
+
+async function walkTree(env, tree, tf, decorOnly) {
+  if (!tree) return;
+  for (const el of tree.children) {
+    if (el.namespaceURI !== P_NS) continue;
+    if (el.localName === 'grpSp') {
+      const gx = aFind(el, 'xfrm');
+      let child = tf;
+      if (gx) {
+        const off = aChild(gx, 'off'), ext = aChild(gx, 'ext');
+        const chOff = aChild(gx, 'chOff'), chExt = aChild(gx, 'chExt');
+        if (off && ext && chOff && chExt) {
+          const sx = (+ext.getAttribute('cx') || 1) / (+chExt.getAttribute('cx') || 1);
+          const sy = (+ext.getAttribute('cy') || 1) / (+chExt.getAttribute('cy') || 1);
+          child = {
+            ox: tf.ox + ((+off.getAttribute('x') || 0) - tf.x0) * tf.sx,
+            oy: tf.oy + ((+off.getAttribute('y') || 0) - tf.y0) * tf.sy,
+            x0: +chOff.getAttribute('x') || 0, y0: +chOff.getAttribute('y') || 0,
+            sx: tf.sx * sx, sy: tf.sy * sy
+          };
+        }
+      }
+      await walkTree(env, el, child, decorOnly);
+      continue;
+    }
+    const ph = pFind(el, 'ph');
+    if (decorOnly && ph) continue;          // 레이아웃·마스터의 안내문은 건너뛰어요
+    if (el.localName === 'sp') await drawShape(env, el, tf, ph);
+    else if (el.localName === 'pic') await drawPicture(env, el, tf);
+    else if (el.localName === 'graphicFrame') await drawFrame(env, el, tf);
+  }
+}
+
+// 슬라이드 도형에 위치가 없으면 레이아웃·마스터의 같은 자리 틀에서 가져와요
+function inheritedXfrm(env, ph) {
+  if (!ph || !env.phSource) return null;
+  const type = ph.getAttribute('type') || 'body', idx = ph.getAttribute('idx') || '';
+  for (const part of [env.phSource.layout, env.phSource.master]) {
+    if (!part) continue;
+    for (const sp of part.getElementsByTagNameNS(P_NS, 'sp')) {
+      const p2 = pFind(sp, 'ph');
+      if (!p2) continue;
+      const t2 = p2.getAttribute('type') || 'body', i2 = p2.getAttribute('idx') || '';
+      const same = (idx && i2 === idx) || (t2 === type) ||
+        (['title', 'ctrTitle'].includes(type) && ['title', 'ctrTitle'].includes(t2));
+      if (same) { const x = aFind(pFind(sp, 'spPr'), 'xfrm'); if (x) return x; }
+    }
+  }
+  return null;
+}
+
+async function drawShape(env, sp, tf, ph) {
+  const spPr = pFind(sp, 'spPr');
+  const xfrm = aFind(spPr, 'xfrm') || inheritedXfrm(env, ph);
+  const box = xfrm ? placeOf(xfrm, tf) : null;
+  if (!box || box.w <= 0 || box.h <= 0) return;
+  const prst = aFind(spPr, 'prstGeom')?.getAttribute('prst') || 'rect';
+  const fill = fillOf(spPr, env.theme);
+  const line = lineOf(spPr, env.theme);
+  const { rgb, degrees, H } = env;
+
+  if (fill || line) {
+    const pos = rotated(box.x, box.y, box.w, box.h, box.rot, H);
+    const style = {
+      x: pos.x, y: pos.y, width: box.w, height: box.h, rotate: degrees(pos.rotate),
+      ...(fill ? { color: rgb(fill.r, fill.g, fill.b) } : { opacity: 0 }),
+      ...(line ? { borderColor: rgb(line.color.r, line.color.g, line.color.b), borderWidth: line.width } : {})
+    };
+    if (/^(ellipse|circle)$/.test(prst)) {
+      env.page.drawEllipse({
+        x: box.x + box.w / 2, y: H - box.y - box.h / 2, xScale: box.w / 2, yScale: box.h / 2,
+        ...(fill ? { color: rgb(fill.r, fill.g, fill.b) } : { opacity: 0 }),
+        ...(line ? { borderColor: rgb(line.color.r, line.color.g, line.color.b), borderWidth: line.width } : {})
+      });
+    } else if (/^(line|straightConnector)/.test(prst) && line) {
+      env.page.drawLine({
+        start: { x: box.x, y: H - box.y }, end: { x: box.x + box.w, y: H - box.y - box.h },
+        color: rgb(line.color.r, line.color.g, line.color.b), thickness: line.width
+      });
+    } else {
+      env.page.drawRectangle(style);
+    }
+  }
+  const body = pFind(sp, 'txBody');
+  if (body) {
+    const fontRef = aFind(pFind(sp, 'style'), 'fontRef');
+    let color = pickColor(fontRef, env.theme);
+    if (!color && fill && (fill.r * 0.299 + fill.g * 0.587 + fill.b * 0.114) < 0.55) color = { r: 1, g: 1, b: 1 };
+    drawTextBody(env, body, box, ph, { color });
+  }
+}
+
+async function drawPicture(env, pic, tf) {
+  const xfrm = aFind(pFind(pic, 'spPr'), 'xfrm');
+  const box = xfrm ? placeOf(xfrm, tf) : null;
+  if (!box || box.w <= 0 || box.h <= 0) return;
+  const blip = aFind(pic, 'blip');
+  const id = blip?.getAttributeNS(R_NS, 'embed');
+  const path = id && env.rels[id]?.path;
+  if (!path) return;
+  const img = await embedImage(env, path);
+  if (!img) { env.skipped.image++; return; }
+  const pos = rotated(box.x, box.y, box.w, box.h, box.rot, env.H);
+  env.page.drawImage(img, { x: pos.x, y: pos.y, width: box.w, height: box.h, rotate: env.degrees(pos.rotate) });
+}
+
+async function embedImage(env, path) {
+  if (env.images.has(path)) return env.images.get(path);
+  let img = null;
+  try {
+    const bytes = await env.pkg.bytes(path);
+    if (bytes) {
+      if (/\.png$/i.test(path)) img = await env.doc.embedPng(bytes);
+      else if (/\.jpe?g$/i.test(path)) img = await env.doc.embedJpg(bytes);
+      else if (/\.(gif|bmp|webp|svg)$/i.test(path)) img = await env.doc.embedPng(await rasterize(bytes, path));
+    }
+  } catch { img = null; }
+  env.images.set(path, img);
+  return img;
+}
+
+// PDF가 모르는 그림 형식은 한 번 그려서 PNG로 바꿔요
+async function rasterize(bytes, path) {
+  const type = /\.svg$/i.test(path) ? 'image/svg+xml' : /\.gif$/i.test(path) ? 'image/gif' : /\.bmp$/i.test(path) ? 'image/bmp' : 'image/webp';
+  const url = URL.createObjectURL(new Blob([bytes], { type }));
+  try {
+    const im = new Image();
+    await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error('image')); im.src = url; });
+    const c = document.createElement('canvas');
+    c.width = im.naturalWidth || 800; c.height = im.naturalHeight || 600;
+    c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function drawFrame(env, frame, tf) {
+  const xfrm = pFind(frame, 'xfrm') || aFind(frame, 'xfrm');
+  const box = xfrm ? placeOf(xfrm, tf) : null;
+  if (!box) return;
+  const tbl = aFind(frame, 'tbl');
+  if (tbl) return drawTable(env, tbl, box);
+  env.skipped.chart++;
+}
+
+function drawTable(env, tbl, box) {
+  const { rgb, H } = env;
+  const grid = [...tbl.getElementsByTagNameNS(A_NS, 'gridCol')].map(c => (+c.getAttribute('w') || 0) / PT);
+  const total = grid.reduce((a, b) => a + b, 0) || box.w;
+  const widths = grid.map(w => w * box.w / total);
+  let y = box.y;
+  for (const tr of tbl.getElementsByTagNameNS(A_NS, 'tr')) {
+    const h = (+tr.getAttribute('h') || 0) / PT || 20;
+    let x = box.x, ci = 0;
+    for (const tc of tr.children) {
+      if (tc.localName !== 'tc') continue;
+      const span = +tc.getAttribute('gridSpan') || 1;
+      const w = widths.slice(ci, ci + span).reduce((a, b) => a + b, 0) || widths[ci] || 60;
+      if (tc.getAttribute('hMerge') !== '1' && tc.getAttribute('vMerge') !== '1') {
+        const fill = fillOf(aChild(tc, 'tcPr'), env.theme);
+        if (fill) env.page.drawRectangle({ x, y: H - y - h, width: w, height: h, color: rgb(fill.r, fill.g, fill.b) });
+        env.page.drawRectangle({ x, y: H - y - h, width: w, height: h, opacity: 0, borderColor: rgb(.72, .75, .8), borderWidth: 0.6 });
+        const body = aChild(tc, 'txBody');
+        if (body) drawTextBody(env, body, { x, y, w, h, rot: 0 }, null, { size: 18, anchor: 'ctr' });
+      }
+      x += w; ci += span;
+    }
+    y += h;
+    if (y > box.y + box.h + 1) break;
+  }
+}
+
+// 레이아웃 쪽 틀에 적힌 글자 규칙을 읽어요 (부제목의 글머리표 없애기 등)
+function layoutTextStyle(env, ph) {
+  if (!ph || !env.phSource?.layout) return null;
+  const type = ph.getAttribute('type') || 'body', idx = ph.getAttribute('idx') || '';
+  for (const sp of env.phSource.layout.getElementsByTagNameNS(P_NS, 'sp')) {
+    const p2 = pFind(sp, 'ph');
+    if (!p2) continue;
+    const t2 = p2.getAttribute('type') || 'body', i2 = p2.getAttribute('idx') || '';
+    if (!((idx && i2 === idx) || t2 === type)) continue;
+    const lst = aChild(pFind(sp, 'txBody'), 'lstStyle');
+    if (!lst) return null;
+    const out = [];
+    for (let i = 1; i <= 9; i++) {
+      const lvl = aChild(lst, `lvl${i}pPr`);
+      if (!lvl) { out.push(null); continue; }
+      const def = aChild(lvl, 'defRPr');
+      const st = {};
+      if (aChild(lvl, 'buNone')) st.bullet = false;
+      if (def?.getAttribute('sz')) st.size = +def.getAttribute('sz') / 100;
+      if (def?.getAttribute('b')) st.bold = def.getAttribute('b') === '1';
+      const c = def && pickColor(aChild(def, 'solidFill'), env.theme);
+      if (c) st.color = c;
+      if (lvl.getAttribute('algn')) st.align = lvl.getAttribute('algn');
+      out.push(st);
+    }
+    return out.some(Boolean) ? out.map(x => x || {}) : null;
+  }
+  return null;
+}
+
+function drawTextBody(env, body, box, ph, opt = {}) {
+  const bodyPr = aChild(body, 'bodyPr');
+  const insL = (+bodyPr?.getAttribute('lIns') || 91440) / PT, insR = (+bodyPr?.getAttribute('rIns') || 91440) / PT;
+  const insT = (+bodyPr?.getAttribute('tIns') || 45720) / PT, insB = (+bodyPr?.getAttribute('bIns') || 45720) / PT;
+  const anchor = bodyPr?.getAttribute('anchor') || opt.anchor || 't';
+  const autofit = aChild(bodyPr, 'normAutofit');
+  const availW = Math.max(6, box.w - insL - insR);
+  const availH = Math.max(6, box.h - insT - insB);
+
+  const type = ph?.getAttribute('type') || '';
+  let styleSet = ['title', 'ctrTitle'].includes(type) ? env.styles.title
+    : ['body', 'subTitle', 'obj', ''].includes(type) ? env.styles.body : env.styles.other;
+  const over = layoutTextStyle(env, ph);
+  if (over) styleSet = styleSet.map((st, i) => ({ ...st, ...(over[i] || over[0] || {}) }));
+  const baseSize = opt.size || (['title', 'ctrTitle'].includes(type) ? 40 : 18);
+
+  let scale = autofit && autofit.getAttribute('fontScale') ? +autofit.getAttribute('fontScale') / 100000 : 1;
+  const bulletable = !!ph && !['title', 'ctrTitle'].includes(type);
+  let lines = layoutLines(env, body, styleSet, baseSize, availW, scale, bulletable, opt.color);
+  let totalH = lines.reduce((s, l) => s + l.h, 0);
+  if (totalH > availH && totalH > 0) {                 // 넘치면 글자를 조금 줄여 담아요
+    scale *= Math.max(0.5, availH / totalH);
+    lines = layoutLines(env, body, styleSet, baseSize, availW, scale, bulletable, opt.color);
+    totalH = lines.reduce((s, l) => s + l.h, 0);
+  }
+  if (!lines.length) return;
+
+  let top = box.y + insT;
+  if (anchor === 'ctr') top += Math.max(0, (availH - totalH) / 2);
+  else if (anchor === 'b') top += Math.max(0, availH - totalH);
+
+  for (const line of lines) {
+    const lineW = line.segs.reduce((s, g) => s + g.w, 0);
+    let x = box.x + insL + line.indent;
+    const room = availW - line.indent;
+    if (line.align === 'ctr') x += Math.max(0, (room - lineW) / 2);
+    else if (line.align === 'r') x += Math.max(0, room - lineW);
+    const baseline = env.H - top - line.h + line.h * 0.24;
+    for (const g of line.segs) {
+      if (g.text.trim()) {
+        try {
+          env.page.drawText(g.text, {
+            x, y: baseline, size: g.size, font: env.fonts[g.bold ? 'b' : 'r'],
+            color: env.rgb(g.color.r, g.color.g, g.color.b)
+          });
+        } catch {}
+      }
+      x += g.w;
+    }
+    top += line.h;
+  }
+}
+
+function layoutLines(env, body, styleSet, baseSize, availW, scale, bulletable, fallbackColor) {
+  const out = [];
+  for (const p of body.getElementsByTagNameNS(A_NS, 'p')) {
+    const pPr = aChild(p, 'pPr');
+    const lvl = Math.min(8, +(pPr?.getAttribute('lvl') || 0));
+    const st = styleSet[lvl] || {};
+    const align = pPr?.getAttribute('algn') || st.align || 'l';
+    const lnSpc = pct(aFind(aChild(pPr, 'lnSpc'), 'spcPct')) || 1;
+    const marL = pPr && pPr.getAttribute('marL') != null ? +pPr.getAttribute('marL') / PT : (st.marL ?? lvl * 27);
+    const bullet = bulletable && !aChild(pPr, 'buNone') && (st.bullet !== false);
+    const buChar = aChild(pPr, 'buChar')?.getAttribute('char') || '•';
+
+    const segs = [];
+    for (const node of p.children) {
+      if (node.namespaceURI !== A_NS) continue;
+      if (node.localName === 'br') { segs.push({ text: '\n' }); continue; }
+      if (node.localName !== 'r' && node.localName !== 'fld') continue;
+      const text = aChild(node, 't')?.textContent || '';
+      if (!text) continue;
+      const rPr = aChild(node, 'rPr');
+      const size = Math.max(4, (rPr?.getAttribute('sz') ? +rPr.getAttribute('sz') / 100 : (st.size || baseSize)) * scale);
+      const bold = rPr ? rPr.getAttribute('b') === '1' : !!st.bold;
+      // 색 우선순위: 글자에 직접 지정한 색 → (틀이 아니면) 도형 스타일 색 → 마스터 기본색
+      const color = pickColor(aChild(rPr, 'solidFill'), env.theme) || (bulletable ? null : fallbackColor) || st.color || fallbackColor || { r: 0.08, g: 0.1, b: 0.13 };
+      segs.push({ text, size, bold, color });
+    }
+    const text = segs.map(s => s.text).join('');
+    if (!text.trim()) {
+      const size = (st.size || baseSize) * scale;
+      out.push({ segs: [], h: size * 1.2 * lnSpc, indent: marL, align });
+      continue;
+    }
+    const wrapped = wrapSegs(env, segs, availW - marL, bullet ? buChar + ' ' : '');
+    wrapped.forEach((line, i) => out.push({
+      segs: line.segs, h: line.size * 1.2 * lnSpc,
+      indent: marL + (i > 0 && bullet ? line.hang : 0), align
+    }));
+  }
+  return out;
+}
+
+// 줄바꿈: 한글·한자는 글자 단위로, 알파벳은 낱말 단위로 끊어요
+function wrapSegs(env, segs, width, prefix) {
+  const measure = (t, size, bold) => env.fonts[bold ? 'b' : 'r'].widthOfTextAtSize(t, size);
+  const lines = [];
+  let cur = { segs: [], size: 0, w: 0, hang: 0 };
+  const push = () => { if (cur.segs.length || lines.length === 0) lines.push(cur); cur = { segs: [], size: cur.size, w: 0, hang: lines[0]?.hang || 0 }; };
+  let first = true;
+  for (const seg of segs) {
+    if (seg.text === '\n') { push(); continue; }
+    const size = seg.size, bold = seg.bold, color = seg.color;
+    cur.size = Math.max(cur.size, size);
+    let tokens = seg.text.match(/[\s]+|[ᄀ-ᇿ　-〿぀-ヿ㐀-鿿가-힯]|[^\sᄀ-ᇿ　-〿぀-ヿ㐀-鿿가-힯]+/g) || [];
+    if (first && prefix) {
+      const w = measure(prefix, size, bold);
+      cur.segs.push({ text: prefix, size, bold, color, w });
+      cur.w += w; cur.hang = w; lines.hang = w;
+      first = false;
+    }
+    for (const tk of tokens) {
+      const w = measure(tk, size, bold);
+      if (cur.w + w > width * 1.06 && cur.w > 0 && !/^\s+$/.test(tk)) { push(); cur.size = size; }
+      if (/^\s+$/.test(tk) && cur.w === 0) continue;
+      const last = cur.segs[cur.segs.length - 1];
+      if (last && last.size === size && last.bold === bold && last.color === color) { last.text += tk; last.w += w; }
+      else cur.segs.push({ text: tk, size, bold, color, w });
+      cur.w += w;
+    }
+  }
+  push();
+  return lines.filter(l => l.segs.length).map(l => ({ segs: l.segs, size: l.size || 12, hang: l.hang || 0 }));
+}
+
 /* ---------------- UI ---------------- */
 
 const fmtSize = b => b < 1024 * 1024 ? (b / 1024).toFixed(0) + ' KB' : (b / 1024 / 1024).toFixed(1) + ' MB';
@@ -1086,6 +1665,8 @@ function showActive() {
   renderPreview(md);
   updateStats(f);
   E.copy.disabled = E.save.disabled = !md;
+  E.pdf.hidden = !(f.kind === 'pptx' && f.buf);
+  E.pdf.disabled = pdfBusy;
 }
 
 function setBusy(f, note) {
@@ -1193,12 +1774,10 @@ E.copy.addEventListener('click', async () => {
 const dlPromise = window.claude?.use ? window.claude.use('downloads').catch(() => null) : Promise.resolve(undefined);
 dlPromise.then(dl => { if (dl === null) { E.save.hidden = true; } });
 
-E.save.addEventListener('click', async () => {
-  const f = current();
-  const filename = f.name.replace(/\.(pdf|pptx)$/i, '') + '.md';
+async function saveFile(filename, data, mime) {
   const dl = await dlPromise;
   if (dl) {
-    try { await dl.save({ filename, data: E.src.value }); toast(filename + ' 저장했어요'); }
+    try { await dl.save({ filename, data }); toast(filename + ' 저장했어요'); }
     catch (e) {
       if (e?.code === 'declined') return;
       if (e?.code === 'rate_limited') toast('저장 창이 이미 열려 있어요. 잠시 뒤 다시 눌러 주세요');
@@ -1206,13 +1785,41 @@ E.save.addEventListener('click', async () => {
     }
     return;
   }
-  const blob = new Blob([E.src.value], { type: 'text/markdown;charset=utf-8' });
+  const blob = new Blob([data], { type: mime });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = filename;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  toast(a.download + ' 저장을 시작했어요');
+  toast(filename + ' 저장을 시작했어요');
+}
+
+const baseName = f => f.name.replace(/\.(pdf|pptx)$/i, '');
+
+E.save.addEventListener('click', () => saveFile(baseName(current()) + '.md', E.src.value, 'text/markdown;charset=utf-8'));
+
+E.pdf.addEventListener('click', async () => {
+  const f = current();
+  if (!f.buf || f.kind !== 'pptx' || pdfBusy) return;
+  pdfBusy = true;
+  E.pdf.disabled = true;
+  E.busy.hidden = false;
+  E.busyText.textContent = 'PDF 만들 준비 중…';
+  E.busyBar.style.width = '0%';
+  try {
+    const res = await pptxToPdf(f.buf.slice(0), (d, t) => {
+      E.busyText.textContent = `${t}장 중 ${d}장 그리는 중…`;
+      E.busyBar.style.width = (d / t) * 100 + '%';
+    });
+    await saveFile(baseName(f) + '.pdf', res.bytes, 'application/pdf');
+    if (res.warning) toast(res.warning);
+  } catch (e) {
+    console.error(e);
+    toast(e?.message || 'PDF로 바꾸지 못했어요');
+  } finally {
+    pdfBusy = false;
+    showActive();
+  }
 });
 
 let tt;
